@@ -1,0 +1,15 @@
+[package]
+name = "balance-fetch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.48.0", features = ["full"] }
+eyre = "0.6.12"
+toml = "0.9.8"
+serde = { version = "1.0.228", features = ["derive"] }
+dotenv = "0.15.0"
+reqwest = { version = "0.12.24", features = ["json"] }
+alloy = { version = "1.1.1", features = ["full"] }
+alloy-provider = "1.1.1"
+alloy-primitives = "1.4.1"
