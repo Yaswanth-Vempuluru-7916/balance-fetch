@@ -1,60 +1,94 @@
-use alloy::network::Ethereum;
-use alloy_primitives::{Address, utils::format_ether};
-use alloy_provider::{Provider, RootProvider};
-use eyre::{Context, Ok, Result, bail};
+use eyre::{Result, WrapErr};
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use std::{fs, path::Path};
-#[derive(Deserialize)]
-pub struct Config {
-    pub rpc_url: String,
-    pub address: String,
+use std::time::Duration;
+use tracing::{error, info, warn};
+
+#[derive(Debug, Deserialize)]
+struct Todo {
+    #[serde(rename = "userId")]
+    user_id: u32,
+    id: u32,
+    title: String,
+    completed: bool,
 }
 
-impl Config {
-    pub fn load_from_toml<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        let contents = fs::read_to_string(path)
-            .wrap_err_with(|| format!("Failed to read config file at {}", path.display()))?;
+async fn fetch_todos(client: &Client) -> Result<Vec<Todo>> {
+    let url = "https://jsonplaceholder.typicode.com/todos";
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .wrap_err(format!("failed to send request to {:?}", url))?;
 
-        let config: Config = toml::from_str(&contents)
-            .wrap_err_with(|| format!("Failed to parse config file at {}", path.display()))?;
+    let status = response.status();
 
-        config
-            .validate()
-            .wrap_err_with(|| format!("Invalid config file at {}", path.display()))?;
+    let body_text = match response.text().await {
+        Ok(text) => text,
+        Err(err) => {
+            return Err(err)
+                .wrap_err("failed to read response body as text (needed for error debugging)");
+        }
+    };
 
-        Ok(config)
+    if !status.is_success() {
+        match status {
+            StatusCode::TOO_MANY_REQUESTS => {
+                warn!("Received 429 — we are being rate limited");
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                warn!("503 from upstream — service temporarily down");
+            }
+            _ => {
+                warn!(%status, body = %body_text, "non-2xx response from API");
+            }
+        }
+        return Err(eyre::eyre!("HTTP {status} — {body_text}"));
     }
 
-    fn validate(&self) -> Result<()> {
-        if self.rpc_url.is_empty() {
-            bail!("rpc_url cannot be empty");
-        }
+    let todos: Vec<Todo> = serde_json::from_str(&body_text)
+        .wrap_err_with(|| format!("failed to parse JSON (body was {} bytes)", body_text.len()))?;
 
-        if self.address.is_empty() {
-            bail!("address cannot be empty");
-        }
-
-        Ok(())
-    }
+    Ok(todos)
 }
 
-async fn get_balance(rpc_url: &str, address_str: &str) -> Result<String> {
-    let provider = RootProvider::<Ethereum>::new_http(rpc_url.parse()?);
-    let address: Address = address_str.parse()?;
-    let balance = provider.get_balance(address).await?;
-    let balance_eth = format_ether(balance);
-    Ok(balance_eth)
-}
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Read input from toml file
-    let config = Config::load_from_toml("config.toml").wrap_err("Failed to load config file")?;
-    println!("Configuration loaded successfully:");
+    color_eyre::install()?;
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
-    //Fetch the balance
-    let balance = get_balance(&config.rpc_url, &config.address).await?;
-    println!("\nBalance: {} ETH", balance);
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(20)
+        .build()
+        .wrap_err("Failed to build reqwest client")?;
+
+    match fetch_todos(&client).await {
+        Ok(todos) => {
+            info!("Fetched {} todos successfully", todos.len());
+            for todo in todos.iter().take(10) {
+                info!(todo.user_id, todo.id, todo.completed, title = %todo.title, "todo");
+            }
+        }
+
+        Err(e) => {
+            error!(error = %e, "Failed to fetch todos — this is expected sometimes");
+            if e.to_string().contains("timeout") {
+                warn!("Request timed out — consider increasing timeout or checking network");
+            } else if e.chain().any(|cause| cause.to_string().contains("429")) {
+                warn!("Rate limited by API — implement retry with backoff");
+            } else {
+                // Re-raise for monitoring / process restart if needed
+                return Err(e);
+            }
+
+            info!("Continuing with empty todo list due to recoverable error");
+        }
+    }
 
     Ok(())
 }
