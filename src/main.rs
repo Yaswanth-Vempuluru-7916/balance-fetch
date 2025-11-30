@@ -3,88 +3,90 @@ use std::{fs, time::Duration};
 use eyre::{Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+fn units_to_human(units: u128, decimals: u8) -> f64 {
+    units as f64 / (10_f64).powi(decimals as i32)
+}
+
+fn string_to_u128<'de, D>(deserializer: D) -> Result<u128, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    s.parse::<u128>().map_err(serde::de::Error::custom)
+}
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
-  status : String,
-  message : String,
-  result : String
+    status: String,
+    message: String,
+    #[serde(deserialize_with = "string_to_u128")]
+    result: u128,
 }
 
 #[derive(Debug, Deserialize)]
 struct Config {
-  rpc_url : String,
-  #[serde(rename = "address")]
-  wallet_address : String,
-  #[serde(rename = "ETHERSCAN_BASE_URL")]
-  etherscan_base_url : String,
-  #[serde(rename = "ETHERSCAN_API_TOKEN")]
-  etherscan_api_key : String,
-  #[serde(rename = "CONTRACT_ADDRESS")]
-  contract_address : String
+    rpc_url: String,
+    wallet_address: String,
+    etherscan_base_url: String,
+    etherscan_api_key: String,
+    contract_address: String,
+    chain_id: u64,
+    chain_name: String,
+    token_symbol: String,
+    token_decimals: u8,
 }
 
 #[tokio::main]
-async fn main()->Result<()>{
-
-  color_eyre::install()?;
-  tracing_subscriber::fmt()
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+    tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
 
-  let config_content = fs::read_to_string("config.toml")?;
-  let config : Config = toml::from_str(&config_content)?;
+    let config_content = fs::read_to_string("config.toml")?;
+    let config: Config = toml::from_str(&config_content)?;
 
-  info!("{:?}",config);
+    // Client Builder -> Client
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(20)
+        .build()
+        .wrap_err(format!("Failed to build the client"))?;
 
-  // Client Builder -> Client
-  let client = Client::builder()
-    .timeout(Duration::from_secs(5))
-    .connect_timeout(Duration::from_secs(5))
-    .pool_idle_timeout(Duration::from_secs(90))
-    .pool_max_idle_per_host(20)
-    .build()
-    .wrap_err(format!("Failed to build the client"))?;
-
-  match fetch_erc_20_balance(&client, &config).await {
-    Ok(balance_response) => {
-      info!("Balance {:?} ", balance_response);
-      info!("Balance {:?}", balance_response.result);
-    },
-    Err(e) => {
-       error!(error = %e, "Failed to fetch balance — this is expected sometimes");
-            if e.to_string().contains("timeout") {
-                warn!("Request timed out — consider increasing timeout or checking network");
-            } else if e.chain().any(|cause| cause.to_string().contains("429")) {
-                warn!("Rate limited by API — implement retry with backoff");
-            } else {
-                // Re-raise for monitoring / process restart if needed
-                return Err(e);
-            }
-    }
-  }
-  Ok(())
-
+    let wei = fetch_erc_20_balance(&client, &config).await?;
+    let usdt_eth = units_to_human(wei, config.token_decimals); // USDT, USDC, BUSD, etc.
+    info!(
+        chain = config.chain_name,
+        wallet = config.wallet_address,
+        token = config.token_symbol,
+        balance_wei = wei,
+        balance_human = %format!("{:.precision$}", usdt_eth, precision = config.token_decimals as usize),
+        "ERC20 balance"
+    );
+    Ok(())
 }
 
+async fn fetch_erc_20_balance(client: &Client, config: &Config) -> Result<u128> {
+    let url = format!(
+        "{base}?apikey={key}&chainid={chain_id}&module=account&action=tokenbalance&contractaddress={contract}&address={addr}&tag=latest",
+        base = config.etherscan_base_url,
+        key = config.etherscan_api_key,
+        chain_id = config.chain_id,
+        contract = config.contract_address,
+        addr = config.wallet_address,
+    );
 
-async fn fetch_erc_20_balance(client : &Client, config : &Config) -> Result<ApiResponse> {
-  let url = format!(
-    "{base}?apikey={key}&chainid=42161&module=account&action=tokenbalance&contractaddress={contract}&address={addr}&tag=latest",
-    base = config.etherscan_base_url,
-    key = config.etherscan_api_key,
-    contract = config.contract_address,
-    addr = config.wallet_address,
-);
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .wrap_err(format!("failed to send request to {:?}", &url))?;
 
-let response = client
-  .get(&url)
-  .send()
-  .await
-  .wrap_err(format!("failed to send request to {:?}", &url))?;
-
-  let status = response.status();
-  let body_text = match response.text().await {
+    let status = response.status();
+    let body_text = match response.text().await {
         Ok(text) => text,
         Err(err) => {
             return Err(err)
@@ -107,9 +109,15 @@ let response = client
         return Err(eyre::eyre!("HTTP {status} — {body_text}"));
     }
 
-    let resp : ApiResponse = serde_json::from_str(&body_text)
-        .wrap_err_with(|| format!("failed to parse JSON (body was {} bytes)", body_text.len()))?;
+    let resp: ApiResponse =
+        serde_json::from_str(&body_text).wrap_err("failed to parse Etherscan response")?;
 
-    Ok(resp)
-
+    if resp.status != "1" {
+        return Err(eyre::eyre!(
+            "Etherscan error: {} - {}",
+            resp.status,
+            resp.message
+        ));
+    }
+    Ok(resp.result)
 }
